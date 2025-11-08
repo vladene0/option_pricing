@@ -2,31 +2,54 @@ import option_pricing as op
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+from joblib import Parallel, delayed
+
+# Work in progress; needs more commenting!
 
 # Time step of one day, expressed in years
 dt = 1/365
 
-# Look for data on historical risk free rates later
-rfr = 0
+# ======= Parameters of the backtest =======
 
-# List of columns to be read as dates
-parse_dates = ["quote_date", "expire_date"]
-option_chain_full = pd.read_csv(r"D:\Scoala\Master-sem3\Practica\spy_2020_2022_30dte.csv", parse_dates=parse_dates)
+ticker = "SPY"                              # Underlying stock to backtest on; currently supported "SPY", "AAPL"
+start_date = pd.to_datetime("2021-07-22")   # Start date for backtesting
+end_date = pd.to_datetime("2021-07-29")     # End date for backtesting
+min_dte = 14                                # Minimum number of days to expiration in order to consider trading an option
+n_below_atm = 1                             # Number of strike prices below atm to evaluate for each dte, for each day
+n_above_atm = 1                             # Number of strike prices above atm to evaluate for each dte, for each day
+n_paths = 500                               # Number of stock evolution paths in the stochastic simulation
+n_simulations = 500                         # Number of simulations over which we average to find an option's most likely price
+min_rel_diff = 0.2                          # Minimum relative difference between market price and simulated price in order to trade an option
+max_rel_diff = 0.3                          # Maximum relative difference between market price and simulated price in order to trade an option
+take_win = 0.1                              # Close profitable positions when the profit is greater than take_win percent above initial market price
+stop_loss = 0.1                             # Close losing positions when the loss is greater than stop_loss percent of the initial market price
 
-# Optionally, plot the stock price evolution
-plot_underlying = False
-if plot_underlying:
-    plt.figure(figsize=(8, 6))
-    plt.plot(option_chain_full["quote_date"], option_chain_full["underlying_last"])
-    plt.xticks(rotation=45)
-    plt.xlabel("Date")
-    plt.ylabel("Price")
-    plt.title("SPY 2020-2022")
-    plt.show()
+# ======= Data reading and preparation =======
 
-# Choose start date and end date for backtesting; check we have data on these dates (they might be weekend days)
-start_date = pd.to_datetime("2021-07-28")
-end_date = pd.to_datetime("2021-07-29")
+project_root_path = r"D:\Scoala\Master-sem3\Practica"
+
+option_chain_paths = {"SPY": project_root_path + r"\spy_2020_2022_30dte.csv",
+                      "AAPL": project_root_path + r"\aapl_2021_2023_30dte.csv"}
+
+interest_rates_path = project_root_path + r"\par-yield-curve-rates-2020-2022.csv"
+
+results_save_path = project_root_path + r"\Results"
+
+# Read historical option chain data
+option_chain_full = pd.read_csv(option_chain_paths[ticker])
+option_chain_full["quote_date"] = pd.to_datetime(option_chain_full["quote_date"], format="%Y-%m-%d")
+option_chain_full["expire_date"] = pd.to_datetime(option_chain_full["expire_date"], format="%Y-%m-%d")
+
+# Read historical risk-free interest rate data
+interest_rates = pd.read_csv(interest_rates_path)
+interest_rates.rename(columns={"Date": "quote_date"}, inplace=True)
+interest_rates["quote_date"] = pd.to_datetime(interest_rates["quote_date"], format="%m/%d/%y")
+
+# We are going to use 1 month interest rates for option pricing over medium-length time periods
+interest_rates["rfr"] = interest_rates["1 Mo"] / 100
+
+# Check we have data on the start and end dates (they might be weekend days)
 unique_dates_full = option_chain_full["quote_date"].drop_duplicates().sort_values().reset_index(drop=True)
 if start_date not in unique_dates_full.values:
     raise ValueError("Invalid backtesting start date! Please choose a working day of the week!")
@@ -34,7 +57,7 @@ if end_date not in unique_dates_full.values:
     raise ValueError("Invalid backtesting end date! Please choose a working day of the week!")
 
 # From the original option chain, select data starting from start_date, up to end_date;
-# Find the last expiry date for options on the end_date, in order to have enough data to track up to expiry options that might have dte remaining on the end_date
+# Find the last expiry date for options on the end_date, in order to have enough data to track up to expiry options that have dte remaining on the end_date
 mask = (option_chain_full["quote_date"] >= start_date) & (option_chain_full["quote_date"] <= end_date)
 option_chain_first_selection = option_chain_full[mask]
 max_expire = option_chain_first_selection["expire_date"].max()
@@ -44,6 +67,17 @@ if max_expire not in unique_dates_full.values:
 # Obtain the final option chain data, starting from start_date, and up to max_expire
 mask = (option_chain_full["quote_date"] >= start_date) & (option_chain_full["quote_date"] <= max_expire)
 option_chain = option_chain_full[mask]
+
+# Merge risk-free interest rate data into the option chain
+option_chain = option_chain.merge(interest_rates[["quote_date", "rfr"]], on="quote_date", how="left")
+option_chain["rfr"] = option_chain["rfr"].ffill()
+
+# Fix some missing price data
+option_chain.loc[option_chain["c_last"] == 0, "c_last"] = 0.01
+option_chain.loc[option_chain["p_last"] == 0, "p_last"] = 0.01
+
+# Create DataFrame for quickly finding current market prices when backtesting
+option_price_lookup = option_chain.set_index(["quote_date", "expire_date", "strike"])
 
 # Find the date 30 trading days before start_date to have enough data for computing volatility
 lookback_days = 30
@@ -66,70 +100,194 @@ daily_data.dropna(subset=["volatility_30d"], inplace=True)
 # Merge volatility data back into the option chain; we will only have volatility values from start_date to end_date
 option_chain = option_chain.merge(daily_data[["quote_date", "volatility_30d"]], on="quote_date", how="left")
 
-# Set some parameters of the backtest
-potential_trades = []
-min_dte = 5
-n_below_atm = 1
-n_above_atm = 1
-n_paths = 50
-n_simulations = 50
-min_rel_diff = 0.2
+# ======= Define function for parallel trade execution =======
 
-# Begin evaluating options from the option chain for each quote date from start_date to end_date
-total_options_evaluated = 0
-for quote_date in daily_data["quote_date"]:
+# This function iterates through the set of options with the same quote_date and dte, the only variable being the strike price;
+# It bundles together all call and put options which are not currently active and does a batch evaluation;
+def check_execute(daily_dte_options, quote_date, dte, stock_price, rfr, volatility):
 
-    # Select options with the same quote date into a separate Data Frame
-    daily_options = option_chain[option_chain["quote_date"] == quote_date].copy()
+    n_calls, n_puts = 0, 0                              # Number of call and put options to evaluate
+    call_strikes, put_strikes = [], []                  # Strike prices at which to evaluate the call and put options
+    call_market_values, put_market_values = [], []      # The market values of the options to evaluate
+    call_ids, put_ids = [], []                          # The identification strings of the options to evaluate
+    executed_trades_local = []                          # A local subset of the trades executed by a given parallel worker
+    active_trades_local = set()                         # A local subset of the trades currently active from a parallel worker
 
-    # Stock price and volatility are constant for a given quote date
-    stock_price = daily_options["underlying_last"].iloc[0]
-    volatility = daily_options["volatility_30d"].iloc[0]
+    # The expiration date is fixed for a given function call, since the dte and quote_date are fixed
+    expiration_date = str(daily_dte_options["expire_date"].iloc[0].date())
 
-    # Loop over the existent dte values
-    for dte in daily_options["dte"].unique():
+    # We only choose to trade options with a minimum number of days to expiration remaining
+    if dte > min_dte:
 
-        # Evaluate options with at least min_dte remaining
-        if dte > min_dte:
+        # For each option calculate distance from the "at the money" option
+        daily_dte_options["distance_atm"] = abs(daily_dte_options["strike"] - stock_price)
+        atm_index = daily_dte_options["distance_atm"].idxmin()
 
-            # Select separately options with the same dte for the current quote date
-            daily_dte_options = daily_options[daily_options["dte"] == dte].copy()
-            dte = int(np.round(dte))
+        # We evaluate only the atm option, n_below_atm, and n_above_atm options
+        options_to_evaluate = daily_dte_options.loc[atm_index - n_below_atm : atm_index + n_above_atm + 1]
 
-            # For each option calculate distance from the "at the money" option
-            daily_dte_options["distance_atm"] = abs(daily_dte_options["strike"] - stock_price)
-            atm_index = daily_dte_options["distance_atm"].idxmin()
+        # Iterate over each row, which contains data for both calls and puts at a given strike price
+        for _, row in options_to_evaluate.iterrows():
+            strike_price = row["strike"]
 
-            # We evaluate only the atm option, n_below_atm, and n_above_atm options
-            options_to_evaluate = daily_dte_options.loc[atm_index - n_below_atm : atm_index + n_above_atm]
+            # An option is uniquely identified through its type, expiration date, and strike price
+            call_id = "call_" + expiration_date + "_" + str(strike_price)
+            put_id = "put_" + expiration_date + "_" + str(strike_price)
 
-            for index, row in options_to_evaluate.iterrows():
-                strike_price = row["strike"]
-                total_options_evaluated += 2
+            if call_id not in active_trades:
+                n_calls += 1
+                call_strikes.append(row["strike"])
+                call_market_values.append(row["c_last"])
+                call_ids.append(call_id)
 
-                call_value = op.stochastic_option(n_paths=n_paths, n_simulations=n_simulations,
-                                                  n_days=dte, initial_price=stock_price, drift=rfr, volatility=volatility,
-                                                  strike_price=strike_price, rfr=rfr, option_type="call")
+            if put_id not in active_trades:
+                n_puts += 1
+                put_strikes.append(row["strike"])
+                put_market_values.append(row["p_last"])
+                put_ids.append(put_id)
 
-                put_value = op.stochastic_option(n_paths=n_paths, n_simulations=n_simulations,
-                                                 n_days=dte, initial_price=stock_price, drift=rfr, volatility=volatility,
-                                                 strike_price=strike_price, rfr=rfr, option_type="put")
+        # Merge the arrays for calls and puts, then evaluate the selected options
+        strike_prices = np.array(call_strikes + put_strikes)
+        market_values = np.array(call_market_values + put_market_values)
+        option_ids = call_ids + put_ids
 
-                # For each evaluated call and put option, calculate relative difference from the market price
-                call_rel_diff = (call_value - row["c_last"]) / row["c_last"]
-                put_rel_diff = (put_value - row["p_last"]) / row["p_last"]
+        option_values = op.stochastic_option(n_paths=n_paths, n_simulations=n_simulations,
+                                             n_days=dte, initial_price=stock_price, drift=rfr, volatility=volatility,
+                                             strike_prices=strike_prices, rfr=rfr, n_calls=n_calls, n_puts=n_puts)
 
-                # If the relative price differences are large enough, keep track of the potential trade
-                if abs(call_rel_diff) > min_rel_diff:
-                    call_trade_dict = {"quote_date": quote_date, "option_type": "call", "dte": dte, "stock_price": stock_price, "strike_price": strike_price,
-                                       "market_price": row["c_last"], "simulation_price": call_value, "relative_difference": call_rel_diff}
-                    potential_trades.append(call_trade_dict)
+        expected_profits = option_values - market_values
+        rel_diffs = expected_profits / market_values
 
-                if abs(put_rel_diff) > min_rel_diff:
-                    put_trade_dict = {"quote_date": quote_date, "option_type": "put", "dte": dte, "stock_price": stock_price, "strike_price": strike_price,
-                                      "market_price": row["p_last"], "simulation_price": put_value, "relative_difference": put_rel_diff}
-                    potential_trades.append(put_trade_dict)
+        for index, rel_diff in enumerate(rel_diffs):
 
-potential_trades_df = pd.DataFrame(potential_trades)
-print(potential_trades_df)
+            # For each of the evaluated options, check the relative difference between the market price and our model's price
+            if min_rel_diff < abs(rel_diff) < max_rel_diff:
+
+                # If a trade meets the criteria to be executed, build a dictionary with the transaction data and append it to the executed_trades_local list
+                trade_dict = {"open_date": quote_date, "expiration_date": expiration_date, "option_type": option_ids[index].split("_")[0], "dte": dte,
+                              "stock_price": stock_price, "strike_price": strike_prices[index],
+                              "market_price": market_values[index], "simulation_price": option_values[index], "relative_difference": rel_diff,
+                              "expected_profit": abs(expected_profits[index]), "action": "buy" if rel_diff > 0 else "sell", "option_id": option_ids[index],
+                              "closed": False, "close_date": None, "close_price": None, "realized_profit": 0.0}
+                executed_trades_local.append(trade_dict)
+                active_trades_local.add(option_ids[index])
+
+    # These are results for a given dte (from one parallel worker); they are later joined with the other results
+    return n_calls + n_puts, executed_trades_local, active_trades_local
+
+# ======= Trade execution and tracking =======
+
+# Begin iterating through all quote dates in order to evaluate options to identify potential trades;
+# Also track the values of the already executed trades in order to close profitable or losing positions
+
+# A numeric variable, a list, and a set to store test information
+total_options_evaluated, executed_trades, active_trades = 0, [], set()
+
+for quote_date in tqdm(option_chain["quote_date"].unique(), ncols=100):
+
+    # First part, opening new positions only up until the end_date
+    if quote_date <= end_date:
+
+        # Select options with the same quote date into a separate Data Frame
+        daily_options = option_chain[option_chain["quote_date"] == quote_date].copy()
+
+        # The stock price, the risk-free rate, and the volatility are constant for a given quote date
+        stock_price = daily_options["underlying_last"].iloc[0]
+        rfr = daily_options["rfr"].iloc[0]
+        volatility = daily_options["volatility_30d"].iloc[0]
+
+        # Run trade execution in parallel over the different dte values; the parallel operations are independent
+        results = Parallel(n_jobs=-1)(delayed(check_execute)(daily_options[daily_options["dte"] == dte].copy(), quote_date,
+                                                             int(np.round(dte)), stock_price, rfr, volatility)
+                                      for dte in daily_options["dte"].unique())
+
+        # Each day, gather the separate parallel results into single objects
+        for n_options_parallel, executed_trades_parallel, active_trades_parallel in results:
+            total_options_evaluated += n_options_parallel
+            executed_trades += executed_trades_parallel
+            active_trades.update(active_trades_parallel)
+
+    # Second part, tracking the daily values of the active options in order to close trades which meet the closing criteria
+    for option_id in active_trades.copy():
+        option_type, expiration_date, strike_price = option_id.split("_")
+        expiration_date = pd.to_datetime(expiration_date)
+        strike_price = float(strike_price)
+
+        try:
+            current_market_price = option_price_lookup.loc[(quote_date, expiration_date, strike_price),
+                                                           "c_last" if option_type == "call" else "p_last"]
+
+            # In the executed_trades list of dictionaries, find the trade with the current option_id which is still active
+            for trade in executed_trades:
+                if trade["option_id"] == option_id and trade["closed"] == False:
+                    action = trade["action"]
+                    initial_market_price = trade["market_price"]
+
+                    current_profit = current_market_price - initial_market_price if action == "buy" else initial_market_price - current_market_price
+
+                    # Check whether to close the current position;
+                    # This is done in 3 cases: the option comes to expiry, or the option increases or decreases significantly in value
+                    if (quote_date == expiration_date or
+                        current_profit > take_win * initial_market_price or
+                        current_profit < -stop_loss * initial_market_price):
+
+                        trade["closed"] = True
+                        trade["close_date"] = quote_date
+                        trade["close_price"] = current_market_price
+                        trade["realized_profit"] = current_profit
+                        active_trades.remove(option_id)
+
+                    break
+
+        # Throw error if the current market price is missing from the data (extremely rare in our current data sets)
+        except KeyError:
+            if quote_date == expiration_date:
+                active_trades.remove(option_id)
+                print(f"Missing data on expiration for option_id: {option_id}! This will lead to an unclosed trade!")
+            else:
+                print(f"Missing data on an intermediary date for option_id: {option_id}! Not that big of a deal.")
+
+# ======= Result analysis and plotting =======
+
+executed_trades_df = pd.DataFrame(executed_trades)
+
+# Keep only trades which were closed; rare cases of unclosed trades might appear when there is missing data on the expiration date of the option
+executed_trades_df = executed_trades_df[executed_trades_df["closed"] == True]
+
+# Save executed trades to a .csv file
+test_id_string = ticker + "_" + str(start_date.date()) + "_" + str(end_date.date())
+executed_trades_df.to_csv(results_save_path + r"\executed_trades_" + test_id_string + ".csv", index=False)
+
 print(f"Number of options evaluated: {total_options_evaluated}")
+print(f"Number of trades executed: {len(executed_trades_df)}")
+print(f"Percentage of evaluated options which were traded: {(len(executed_trades_df) / total_options_evaluated):.2f}")
+
+profit_data = executed_trades_df.groupby("close_date", as_index=False)["realized_profit"].sum()
+profit_data = profit_data.sort_values("close_date").reset_index(drop=True)
+profit_data["cumulative_profit"] = profit_data["realized_profit"].cumsum()
+
+total_profit = profit_data["cumulative_profit"].iloc[-1]
+total_capital_required = executed_trades_df["market_price"].sum()
+total_percentage_return = total_profit / total_capital_required
+
+print(f"Total profit: {total_profit:.2f}")
+print(f"Total capital required: {total_capital_required:.2f}")
+print(f"Total percentage return: {total_percentage_return:.4f}")
+
+# Plot the results of the backtest
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 6))
+
+ax1.plot(profit_data["close_date"], profit_data["cumulative_profit"])
+ax1.set_xlabel("Date")
+ax1.set_ylabel("Cumulative profit")
+ax1.tick_params(axis="x", rotation=45)
+ax1.set_title("Realized cumulative profit")
+
+ax2.plot(profit_data["close_date"], profit_data["cumulative_profit"] / total_capital_required)
+ax2.set_xlabel("Date")
+ax2.set_ylabel("Percentage return")
+ax2.tick_params(axis="x", rotation=45)
+ax2.set_title("Realized percentage return")
+
+plt.tight_layout()
+plt.savefig(results_save_path + r"\profit_" + test_id_string + ".png", bbox_inches="tight")
