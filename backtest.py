@@ -13,6 +13,7 @@ dt = 1/365
 # ======= Parameters of the backtest =======
 
 ticker = "SPY"                              # Underlying stock to backtest on; currently supported "SPY", "AAPL"
+stock_model = "gbm"                         # Model used for the stochastic simulation of the stock price; currently supported "gbm", "heston"
 start_date = pd.to_datetime("2021-07-22")   # Start date for backtesting
 end_date = pd.to_datetime("2021-07-29")     # End date for backtesting
 min_dte = 14                                # Minimum number of days to expiration in order to consider trading an option
@@ -79,11 +80,12 @@ option_chain.loc[option_chain["p_last"] == 0, "p_last"] = 0.01
 # Create DataFrame for quickly finding current market prices when backtesting
 option_price_lookup = option_chain.set_index(["quote_date", "expire_date", "strike"])
 
-# Find the date 30 trading days before start_date to have enough data for computing volatility
-lookback_days = 30
+# Find the right date before start_date to have enough data for computing volatility and vol of variance
+window = 30
+lookback_days = 1 + 2 * (window - 1)
 start_idx = unique_dates_full[unique_dates_full == start_date].index[0]
-if start_idx < 30:
-    raise ValueError("Please choose a later start date; not enough data to compute volatility!")
+if start_idx < lookback_days:
+    raise ValueError("Please choose a later start date; not enough data to compute volatility or vol of variance!")
 lookback_idx = start_idx - lookback_days
 lookback_start = unique_dates_full.iloc[lookback_idx]
 
@@ -92,19 +94,21 @@ daily_data = option_chain_full.groupby("quote_date")["underlying_last"].first().
 daily_data["quote_date"] = pd.to_datetime(daily_data["quote_date"])
 daily_data = daily_data[(daily_data["quote_date"] >= lookback_start) & (daily_data["quote_date"] <= end_date)]
 
-# Calculate log returns and 30-day volatility
+# Calculate log returns, 30-day volatility, 30-day variance, and 30-day volatility of variance
 daily_data["log_returns"] = np.log(daily_data["underlying_last"] / daily_data["underlying_last"].shift(1))
-daily_data["volatility_30d"] = daily_data["log_returns"].rolling(window=lookback_days).std() * np.sqrt(1/dt)
-daily_data.dropna(subset=["volatility_30d"], inplace=True)
+daily_data["volatility_30d"] = daily_data["log_returns"].rolling(window=window).std() * np.sqrt(1/dt)
+daily_data["variance_30d"] = daily_data["volatility_30d"]**2
+daily_data["vol_of_variance_30d"] = daily_data["variance_30d"].rolling(window=window).std() * np.sqrt(1/dt)  # Not sure about the sqrt here! Look it up later.
+daily_data.dropna(subset=["vol_of_variance_30d"], inplace=True)
 
 # Merge volatility data back into the option chain; we will only have volatility values from start_date to end_date
-option_chain = option_chain.merge(daily_data[["quote_date", "volatility_30d"]], on="quote_date", how="left")
+option_chain = option_chain.merge(daily_data[["quote_date", "volatility_30d", "variance_30d", "vol_of_variance_30d"]], on="quote_date", how="left")
 
 # ======= Define function for parallel trade execution =======
 
 # This function iterates through the set of options with the same quote_date and dte, the only variable being the strike price;
 # It bundles together all call and put options which are not currently active and does a batch evaluation;
-def check_execute(daily_dte_options, quote_date, dte, stock_price, rfr, volatility):
+def check_execute(daily_dte_options, quote_date, dte, stock_price, rfr, volatility, mean_variance, vol_of_variance):
 
     n_calls, n_puts = 0, 0                              # Number of call and put options to evaluate
     call_strikes, put_strikes = [], []                  # Strike prices at which to evaluate the call and put options
@@ -151,9 +155,13 @@ def check_execute(daily_dte_options, quote_date, dte, stock_price, rfr, volatili
         market_values = np.array(call_market_values + put_market_values)
         option_ids = call_ids + put_ids
 
-        option_values = op.stochastic_option(n_paths=n_paths, n_simulations=n_simulations,
-                                             n_days=dte, initial_price=stock_price, drift=rfr, volatility=volatility,
-                                             strike_prices=strike_prices, rfr=rfr, n_calls=n_calls, n_puts=n_puts)
+        # Call our function for predicting prices with a stochastic model
+        option_values = op.stochastic_option(n_paths=n_paths, n_days=dte,
+                                             initial_price=stock_price, drift=rfr,
+                                             volatility=volatility,
+                                             mean_variance=mean_variance, vol_of_variance=vol_of_variance,
+                                             strike_prices=strike_prices, rfr=rfr, n_calls=n_calls, n_puts=n_puts,
+                                             stock_model=stock_model, n_simulations=n_simulations)
 
         expected_profits = option_values - market_values
         rel_diffs = expected_profits / market_values
@@ -191,14 +199,16 @@ for quote_date in tqdm(option_chain["quote_date"].unique(), ncols=100):
         # Select options with the same quote date into a separate Data Frame
         daily_options = option_chain[option_chain["quote_date"] == quote_date].copy()
 
-        # The stock price, the risk-free rate, and the volatility are constant for a given quote date
+        # The stock price, the risk-free rate, the volatility, the variance, and the vol of variance are constant for a given quote date
         stock_price = daily_options["underlying_last"].iloc[0]
         rfr = daily_options["rfr"].iloc[0]
         volatility = daily_options["volatility_30d"].iloc[0]
+        mean_variance = daily_options["variance_30d"].iloc[0]
+        vol_of_variance = daily_options["vol_of_variance_30d"].iloc[0]
 
         # Run trade execution in parallel over the different dte values; the parallel operations are independent
         results = Parallel(n_jobs=-1)(delayed(check_execute)(daily_options[daily_options["dte"] == dte].copy(), quote_date,
-                                                             int(np.round(dte)), stock_price, rfr, volatility)
+                                                             int(np.round(dte)), stock_price, rfr, volatility, mean_variance, vol_of_variance)
                                       for dte in daily_options["dte"].unique())
 
         # Each day, gather the separate parallel results into single objects

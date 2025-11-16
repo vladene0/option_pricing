@@ -8,6 +8,67 @@ from numba import njit
 # Time step corresponding to 1 day, expressed in years
 dt = 1/365
 
+# Class used to simulate stock price evolution using Geometric Brownian Motion
+class StockGBM:
+    def __init__(self, n_paths, n_days, initial_price, drift, volatility):
+        self.n_paths = n_paths              # We simulate stock price evolution on "n_paths" paths for stochastic pricing of options
+        self.n_days = n_days                # Number of days to expiry for the option
+        self.initial_price = initial_price  # Initial stock price
+        self.drift = drift                  # Drift of the stock
+        self.volatility = volatility        # Volatility of the stock
+
+    def simulate(self):
+        # Independent random samples from the normal distribution used to build stock price path
+        eps = np.random.normal(size=(self.n_paths, self.n_days))
+        log_returns = (self.drift - 0.5 * self.volatility**2) * dt + self.volatility * eps * np.sqrt(dt)
+
+        # This 2-d array contains "n_paths" simulated paths for the stock price evolution, each with "n_days" time steps, plus the initial step
+        prices = np.zeros((self.n_paths, self.n_days + 1))
+        prices[:, 0] = self.initial_price
+        prices[:, 1:] = self.initial_price * np.exp(np.cumsum(log_returns, axis=1))
+
+        return prices
+
+# Class used to simulate stock price evolution using the Heston Model (Stochastic Volatility)
+class StockHeston:
+    def __init__(self, n_paths, n_days, initial_price, drift, mean_variance, var_return_rate, vol_of_variance, correlation):
+        self.n_paths = n_paths
+        self.n_days = n_days
+        self.initial_price = initial_price
+        self.drift = drift
+        self.mean_variance = mean_variance          # Mean value to which the variance (square of volatility) returns during the simulation
+        self.var_return_rate = var_return_rate      # The rate at which the variance returns to the mean
+        self.vol_of_variance = vol_of_variance      # The volatility of the variance
+        self.correlation = correlation              # The correlation between the random processes of the stock and the variance
+
+    def simulate(self):
+        # Generate random samples from the normal distribution for the stock and variance and then correlate them
+        eps1 = np.random.normal(size=(self.n_paths, self.n_days))
+        eps2 = np.random.normal(size=(self.n_paths, self.n_days))
+        eps1_corr, eps2_corr = eps1, self.correlation * eps1 + np.sqrt(1 - self.correlation**2) * eps2
+
+        # Create 2-d numpy array to store the values of the variance across the time steps, for each of the simulation paths
+        variances = np.zeros((self.n_paths, self.n_days + 1))
+        variances[:, 0] = self.mean_variance
+
+        # Calculate variances independently
+        for j in range(1, self.n_days + 1):
+            variances[:, j] = (variances[:, j-1] + self.var_return_rate * (self.mean_variance - variances[:, j-1]) * dt +
+                               self.vol_of_variance * np.sqrt(variances[:, j-1]) * eps2_corr[:, j-1] * np.sqrt(dt))
+            
+            # Make sure the variance is never negative (since it is the square of the volatility, it has to be positive)
+            variances[:, j] = np.maximum(variances[:, j], 0)
+
+        # Array to store prices for each simulation path
+        prices = np.zeros((self.n_paths, self.n_days + 1))
+        prices[:, 0] = self.initial_price
+
+        # Compute price evolution in exponential form
+        log_returns = (self.drift - 0.5 * variances[:, :-1]) * dt + np.sqrt(variances[:, :-1]) * eps1_corr * np.sqrt(dt)
+        prices[:, 1:] = self.initial_price * np.exp(np.cumsum(log_returns, axis=1))
+
+        return prices
+
 @njit
 def quadratic_fit(x, y):
     """
@@ -54,27 +115,6 @@ def quadratic_fit(x, y):
 
     # Return values of fitted quadratic function evaluated at coordinates x
     return a * x**2 + b * x + c
-
-# Class used to simulate stock price evolution using Geometric Brownian Motion
-class StockGBM:
-    def __init__(self, n_paths, n_days, initial_price, drift, volatility):
-        self.n_paths = n_paths              # We simulate stock price evolution on "n_paths" paths for stochastic pricing of options
-        self.n_days = n_days                # Number of days to expiry for the option
-        self.initial_price = initial_price  # Initial stock price
-        self.drift = drift                  # Drift of the stock
-        self.volatility = volatility        # Volatility of the stock
-
-    def simulate(self):
-        # Independent random samples from the normal distribution used to build stock price path
-        eps = np.random.normal(size = (self.n_paths, self.n_days))
-        log_returns = (self.drift - 0.5 * self.volatility**2) * dt + self.volatility * eps * np.sqrt(dt)
-
-        # This 2-d array contains "n_paths" simulated paths for the stock price evolution, each with "n_days" time steps, plus the initial step
-        prices = np.zeros((self.n_paths, self.n_days + 1))
-        prices[:, 0] = self.initial_price
-        prices[:, 1:] = self.initial_price * np.exp(np.cumsum(log_returns, axis = 1))
-
-        return prices
 
 # Class used for American-style option pricing with the Least Squares Monte Carlo method
 class OptionLSMC:
@@ -159,12 +199,30 @@ class OptionLSMC:
     def evaluate(self, stock_prices):
         return OptionLSMC.lsmc_batch(stock_prices, self.strike_prices, self.rfr, self.n_calls, self.n_puts, dt)
 
-# Function for evaluating the price of an option with the LSMC algorithm, using a stochastic model for the stock price evolution
-def stochastic_option(n_paths=250, n_days=30, initial_price=100, drift=0.05, volatility=0.1, strike_prices=np.array([100]), rfr=0.05,
-                      n_calls=1, n_puts=0, stock_model="gbm", option_model="lsmc", n_simulations=100):
+def stochastic_option(n_paths=250, n_days=30,
+                      initial_price=100, drift=0.05,
+                      volatility=0.1,
+                      mean_variance=0.2**2, var_return_rate=0.4, vol_of_variance=0.2, correlation=0.0,
+                      strike_prices=np.array([100]), rfr=0.05, n_calls=1, n_puts=0,
+                      stock_model="gbm", option_model="lsmc", n_simulations=100):
+    """
+    Function for batch evaluation of the prices of options at different strikes (same quote day and dte)
+    with the LSMC algorithm, using a stochastic model for the stock price evolution.
 
+    Parameters:
+        strike_prices (1-d numpy array): Array of batch strike prices at which to evaluate options.
+                                         First n_calls elements are call strikes, the last n_puts are put strikes.
+        n_calls (int): Number of call options to evaluate.
+        n_puts (int): Number of put options to evaluate.
+        stock_model (string): The model used for stock price simulation. Currently supported are "gbm", "heston".
+
+    Returns:
+        1-d numpy array: Predicted values of each option for the corresponding strike prices in the batch strike_prices array.
+    """
     if stock_model == "gbm":
         s_model = StockGBM(n_paths, n_days, initial_price, drift, volatility)
+    elif stock_model == "heston":
+        s_model = StockHeston(n_paths, n_days, initial_price, drift, mean_variance, var_return_rate, vol_of_variance, correlation)
     else:
         raise TypeError("Invalid stock model!")
 
