@@ -2,10 +2,9 @@ import option_pricing as op
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import yfinance as yf
 from tqdm import tqdm
 from joblib import Parallel, delayed
-
-# Work in progress; needs more commenting!
 
 # Time step of one day, expressed in years
 dt = 1/365
@@ -13,9 +12,9 @@ dt = 1/365
 # ======= Parameters of the backtest =======
 
 ticker = "SPY"                              # Underlying stock to backtest on; currently supported "SPY", "AAPL"
-stock_model = "gbm"                         # Model used for the stochastic simulation of the stock price; currently supported "gbm", "heston"
+stock_model = "jd"                          # Model used for the stochastic simulation of the stock price; currently supported "gbm", "heston", "jd"
 start_date = pd.to_datetime("2021-07-22")   # Start date for backtesting
-end_date = pd.to_datetime("2021-07-29")     # End date for backtesting
+end_date = pd.to_datetime("2022-07-27")     # End date for backtesting
 min_dte = 14                                # Minimum number of days to expiration in order to consider trading an option
 n_below_atm = 1                             # Number of strike prices below atm to evaluate for each dte, for each day
 n_above_atm = 1                             # Number of strike prices above atm to evaluate for each dte, for each day
@@ -25,8 +24,15 @@ min_rel_diff = 0.2                          # Minimum relative difference betwee
 max_rel_diff = 0.3                          # Maximum relative difference between market price and simulated price in order to trade an option
 take_win = 0.1                              # Close profitable positions when the profit is greater than take_win percent above initial market price
 stop_loss = 0.1                             # Close losing positions when the loss is greater than stop_loss percent of the initial market price
+window_vol = 30                             # Size of window for volatility calculation (in days)
+n_days_calibration = 1                      # Number of days before current pricing date from which we take data for Heston calibration
+n_dte_calibration = 5                       # Number of dte values per day for Heston calibration; total data points per day = (1call+1put)*n_dte_calibration
+n_years_jump_data = 5                       # Number of years before current date from which we extract jump data for the Jump-Diffusion model
+min_jump_size = 0.06                        # Minimum difference in stock price between consecutive days to count as a jump (percentage of initial price)
 
 # ======= Data reading and preparation =======
+
+# ------- Loading the data from our csv files -------
 
 project_root_path = r"D:\Scoala\Master-sem3\Practica"
 
@@ -50,11 +56,13 @@ interest_rates["quote_date"] = pd.to_datetime(interest_rates["quote_date"], form
 # We are going to use 1 month interest rates for option pricing over medium-length time periods
 interest_rates["rfr"] = interest_rates["1 Mo"] / 100
 
+# ------- Validate backtest date interval and select only the relevant data -------
+
 # Check we have data on the start and end dates (they might be weekend days)
-unique_dates_full = option_chain_full["quote_date"].drop_duplicates().sort_values().reset_index(drop=True)
-if start_date not in unique_dates_full.values:
+unique_dates = option_chain_full["quote_date"].drop_duplicates().sort_values().reset_index(drop=True)
+if start_date not in unique_dates.values:
     raise ValueError("Invalid backtesting start date! Please choose a working day of the week!")
-if end_date not in unique_dates_full.values:
+if end_date not in unique_dates.values:
     raise ValueError("Invalid backtesting end date! Please choose a working day of the week!")
 
 # From the original option chain, select data starting from start_date, up to end_date;
@@ -62,53 +70,98 @@ if end_date not in unique_dates_full.values:
 mask = (option_chain_full["quote_date"] >= start_date) & (option_chain_full["quote_date"] <= end_date)
 option_chain_first_selection = option_chain_full[mask]
 max_expire = option_chain_first_selection["expire_date"].max()
-if max_expire not in unique_dates_full.values:
+if max_expire not in unique_dates.values:
     raise ValueError("Please choose an earlier end date; not enough data to track all options to expiration!")
 
-# Obtain the final option chain data, starting from start_date, and up to max_expire
-mask = (option_chain_full["quote_date"] >= start_date) & (option_chain_full["quote_date"] <= max_expire)
-option_chain = option_chain_full[mask]
+# Obtain the final option chain data, starting from n_days_calibration before start_date (for model calibration data), and up to max_expire
+start_date_idx = unique_dates[unique_dates == start_date].index[0]
+calibration_start = unique_dates.loc[start_date_idx - n_days_calibration]
+mask = (option_chain_full["quote_date"] >= calibration_start) & (option_chain_full["quote_date"] <= max_expire)
+option_chain = option_chain_full[mask].copy()
 
-# Merge risk-free interest rate data into the option chain
-option_chain = option_chain.merge(interest_rates[["quote_date", "rfr"]], on="quote_date", how="left")
-option_chain["rfr"] = option_chain["rfr"].ffill()
+# ------- Some basic data cleaning and processing -------
+
+# For each option, calculate the distance from the "at the money" level
+option_chain["distance_atm"] = abs(option_chain["strike"] - option_chain["underlying_last"])
 
 # Fix some missing price data
 option_chain.loc[option_chain["c_last"] == 0, "c_last"] = 0.01
 option_chain.loc[option_chain["p_last"] == 0, "p_last"] = 0.01
 
+# Fix some non-integer dte values (ex. 5.99, and so on)
+option_chain["dte"] = option_chain["dte"].round().astype(int)
+
 # Create DataFrame for quickly finding current market prices when backtesting
 option_price_lookup = option_chain.set_index(["quote_date", "expire_date", "strike"])
 
-# Find the right date before start_date to have enough data for computing volatility and vol of variance
-window = 30
-lookback_days = 1 + 2 * (window - 1)
-start_idx = unique_dates_full[unique_dates_full == start_date].index[0]
-if start_idx < lookback_days:
-    raise ValueError("Please choose a later start date; not enough data to compute volatility or vol of variance!")
-lookback_idx = start_idx - lookback_days
-lookback_start = unique_dates_full.iloc[lookback_idx]
+# Merge risk-free interest rate data into the option chain
+option_chain = option_chain.merge(interest_rates[["quote_date", "rfr"]], on="quote_date", how="left")
+option_chain["rfr"] = option_chain["rfr"].ffill()
 
-# Create separate dataframe to store daily data for closing prices and volatility
+# ------- Compute model parameters from historical data -------
+
+# Find the right date before start_date to have enough data for computing volatility and vol of variance, as well as for Heston calibration
+# n_days_calibration for calibration data; window - 1 for volatility; window - 1 for vol_of_variance
+lookback_days = n_days_calibration + 2 * (window_vol - 1)
+if start_date_idx < lookback_days:
+    raise ValueError("Please choose a later start date; not enough data to compute volatility or vol of variance!")
+lookback_idx = start_date_idx - lookback_days
+lookback_start = unique_dates.iloc[lookback_idx]
+
+# Create separate dataframe to store daily data for closing prices
 daily_data = option_chain_full.groupby("quote_date")["underlying_last"].first().reset_index()
 daily_data["quote_date"] = pd.to_datetime(daily_data["quote_date"])
 daily_data = daily_data[(daily_data["quote_date"] >= lookback_start) & (daily_data["quote_date"] <= end_date)]
 
-# Calculate log returns, 30-day volatility, 30-day variance, and 30-day volatility of variance
+# Download underlying price data from YahooFinance for the Jump-Diffusion model, going back quite a few years
+jump_start = start_date - pd.DateOffset(years=n_years_jump_data)
+jump_end = end_date + pd.DateOffset(days=1)
+
+# We only need the closing prices for each date
+jump_data = yf.Ticker(ticker).history(start=str(jump_start.date()), end=str(jump_end.date()), interval="1d", auto_adjust=False)
+jump_data = jump_data["Close"].reset_index()
+jump_data.rename(columns={"Date": "quote_date", "Close": "underlying_last"}, inplace=True)
+jump_data["quote_date"] = pd.to_datetime(jump_data["quote_date"]).dt.tz_localize(None)
+
+# The number of past days over which we count jumps for a given date - equal to the number of trading days in the "n_years_jump_data" past years
+jump_window_days = len(jump_data[jump_data["quote_date"] < start_date])
+
+# Combine the jump_data with the original daily_data
+jump_data = jump_data[jump_data["quote_date"] < lookback_start]
+daily_data = pd.concat([jump_data, daily_data]).reset_index(drop=True)
+
+# Calculate log returns - the logarithm of the ratio of consecutive closing prices
 daily_data["log_returns"] = np.log(daily_data["underlying_last"] / daily_data["underlying_last"].shift(1))
-daily_data["volatility_30d"] = daily_data["log_returns"].rolling(window=window).std() * np.sqrt(1/dt)
+
+# Find days where jumps happened and for each day count the number of jumps that happened in the past window
+jump_bool = (daily_data["log_returns"] > np.log(1 + min_jump_size)) | (daily_data["log_returns"] < np.log(1 - min_jump_size))
+daily_data["jump_count"] = jump_bool.rolling(window=jump_window_days, min_periods=1).sum().shift(1)
+daily_data["jumps_per_year"] = daily_data["jump_count"] / n_years_jump_data
+
+# Obtain the mean and standard deviation of the log-jumps in the given window
+log_returns_roll = daily_data["log_returns"].where(jump_bool).rolling(window=jump_window_days, min_periods=1)
+daily_data["log_jump_avg"] = log_returns_roll.mean().shift(1)
+daily_data["log_jump_std"] = log_returns_roll.std().shift(1)
+
+# Filter once again to get rid of unnecessary jump data
+daily_data = daily_data[daily_data["quote_date"] >= lookback_start]
+
+# Obtain 30-day volatility, 30-day variance, and 30-day volatility of variance
+daily_data["volatility_30d"] = daily_data["log_returns"].rolling(window=window_vol).std() * np.sqrt(1/dt)
 daily_data["variance_30d"] = daily_data["volatility_30d"]**2
-daily_data["vol_of_variance_30d"] = daily_data["variance_30d"].rolling(window=window).std() * np.sqrt(1/dt)  # Not sure about the sqrt here! Look it up later.
+daily_data["vol_of_variance_30d"] = daily_data["variance_30d"].rolling(window=window_vol).std() * np.sqrt(1/dt)
 daily_data.dropna(subset=["vol_of_variance_30d"], inplace=True)
 
-# Merge volatility data back into the option chain; we will only have volatility values from start_date to end_date
-option_chain = option_chain.merge(daily_data[["quote_date", "volatility_30d", "variance_30d", "vol_of_variance_30d"]], on="quote_date", how="left")
+# Merge calculated data back into the option chain
+option_chain = option_chain.merge(daily_data[["quote_date", "volatility_30d", "variance_30d", "vol_of_variance_30d",
+                                              "jumps_per_year", "log_jump_avg", "log_jump_std"]], on="quote_date", how="left")
 
 # ======= Define function for parallel trade execution =======
 
 # This function iterates through the set of options with the same quote_date and dte, the only variable being the strike price;
 # It bundles together all call and put options which are not currently active and does a batch evaluation;
-def check_execute(daily_dte_options, quote_date, dte, stock_price, rfr, volatility, mean_variance, vol_of_variance):
+def check_execute(daily_dte_options, quote_date, dte, stock_price, rfr, volatility,
+                  mean_variance, vol_of_variance, var_return_rate, correlation, n_jumps_avg, log_jump_size_avg, log_jump_size_std):
 
     n_calls, n_puts = 0, 0                              # Number of call and put options to evaluate
     call_strikes, put_strikes = [], []                  # Strike prices at which to evaluate the call and put options
@@ -123,8 +176,7 @@ def check_execute(daily_dte_options, quote_date, dte, stock_price, rfr, volatili
     # We only choose to trade options with a minimum number of days to expiration remaining
     if dte > min_dte:
 
-        # For each option calculate distance from the "at the money" option
-        daily_dte_options["distance_atm"] = abs(daily_dte_options["strike"] - stock_price)
+        # Find the option which is "at the money"
         atm_index = daily_dte_options["distance_atm"].idxmin()
 
         # We evaluate only the atm option, n_below_atm, and n_above_atm options
@@ -156,12 +208,13 @@ def check_execute(daily_dte_options, quote_date, dte, stock_price, rfr, volatili
         option_ids = call_ids + put_ids
 
         # Call our function for predicting prices with a stochastic model
-        option_values = op.stochastic_option(n_paths=n_paths, n_days=dte,
-                                             initial_price=stock_price, drift=rfr,
+        option_values = op.stochastic_option(n_paths=n_paths, n_days=dte, initial_price=stock_price, drift=rfr,
+                                             strike_prices=strike_prices, rfr=rfr, n_calls=n_calls, n_puts=n_puts,
+                                             n_simulations=n_simulations, stock_model=stock_model,
                                              volatility=volatility,
                                              mean_variance=mean_variance, vol_of_variance=vol_of_variance,
-                                             strike_prices=strike_prices, rfr=rfr, n_calls=n_calls, n_puts=n_puts,
-                                             stock_model=stock_model, n_simulations=n_simulations)
+                                             var_return_rate=var_return_rate, correlation=correlation,
+                                             n_jumps_avg=n_jumps_avg, log_jump_size_avg=log_jump_size_avg, log_jump_size_std=log_jump_size_std)
 
         expected_profits = option_values - market_values
         rel_diffs = expected_profits / market_values
@@ -193,22 +246,52 @@ total_options_evaluated, executed_trades, active_trades = 0, [], set()
 
 for quote_date in tqdm(option_chain["quote_date"].unique(), ncols=100):
 
-    # First part, opening new positions only up until the end_date
-    if quote_date <= end_date:
+    # First part, opening new positions only up until the end_date, also keeping in mind option_chain contains data one day before start for calibration
+    if start_date <= quote_date <= end_date:
 
         # Select options with the same quote date into a separate Data Frame
-        daily_options = option_chain[option_chain["quote_date"] == quote_date].copy()
+        daily_options = option_chain[option_chain["quote_date"] == quote_date]
 
-        # The stock price, the risk-free rate, the volatility, the variance, and the vol of variance are constant for a given quote date
+        # The stock price, the risk-free rate, and the volatility are constant for a given quote date
         stock_price = daily_options["underlying_last"].iloc[0]
         rfr = daily_options["rfr"].iloc[0]
         volatility = daily_options["volatility_30d"].iloc[0]
-        mean_variance = daily_options["variance_30d"].iloc[0]
-        vol_of_variance = daily_options["vol_of_variance_30d"].iloc[0]
+
+        # If we use the Heston model for the stock, we need to extract its parameters; the mean_variance and vol_of_variance are calculated
+        # directly from the historical data, while the var_return_rate and correlation are obtained with our calibration function
+        if stock_model == "heston":
+            mean_variance = daily_options["variance_30d"].iloc[0]
+            vol_of_variance = daily_options["vol_of_variance_30d"].iloc[0]
+
+            # Get options from the n_days_calibration previous days for model calibration
+            calib_start_date_idx = unique_dates[unique_dates == quote_date].index[0] - n_days_calibration
+            calib_end_date_idx = unique_dates[unique_dates == quote_date].index[0] - 1
+            calib_start_date = unique_dates.loc[calib_start_date_idx]
+            calib_end_date = unique_dates.loc[calib_end_date_idx]
+            calibration_data = option_chain[(option_chain["quote_date"] >= calib_start_date) & (option_chain["quote_date"] <= calib_end_date)]
+
+            # Select a subset of the calibration data: for each quote_date and for each dte select the ATM options, then select n_dte_calibration rows for each day
+            calibration_data = calibration_data.loc[calibration_data.groupby(["quote_date", "dte"])["distance_atm"].idxmin()]
+            calibration_data = calibration_data.groupby("quote_date").head(n_dte_calibration)
+
+            var_return_rate, correlation = op.StockHeston.calibrate(calibration_data)
+        
+        # In case we use other stock models, the values of the Heston parameters don't matter, but we still need to set them
+        else:
+            mean_variance, vol_of_variance, var_return_rate, correlation = None, None, None, None
+
+        # Get model parameters for Jump-Diffusion
+        if stock_model == "jd":
+            n_jumps_avg = daily_options["jumps_per_year"].iloc[0]
+            log_jump_size_avg = daily_options["log_jump_avg"].iloc[0]
+            log_jump_size_std = daily_options["log_jump_std"].iloc[0]
+        else:
+            n_jumps_avg, log_jump_size_avg, log_jump_size_std = None, None, None
 
         # Run trade execution in parallel over the different dte values; the parallel operations are independent
-        results = Parallel(n_jobs=-1)(delayed(check_execute)(daily_options[daily_options["dte"] == dte].copy(), quote_date,
-                                                             int(np.round(dte)), stock_price, rfr, volatility, mean_variance, vol_of_variance)
+        results = Parallel(n_jobs=-1)(delayed(check_execute)(daily_options[daily_options["dte"] == dte], quote_date, dte,
+                                                             stock_price, rfr, volatility, mean_variance, vol_of_variance, var_return_rate, correlation,
+                                                             n_jumps_avg, log_jump_size_avg, log_jump_size_std)
                                       for dte in daily_options["dte"].unique())
 
         # Each day, gather the separate parallel results into single objects
@@ -265,7 +348,7 @@ executed_trades_df = pd.DataFrame(executed_trades)
 executed_trades_df = executed_trades_df[executed_trades_df["closed"] == True]
 
 # Save executed trades to a .csv file
-test_id_string = ticker + "_" + str(start_date.date()) + "_" + str(end_date.date())
+test_id_string = ticker + "_" + stock_model + "_" + str(start_date.date()) + "_" + str(end_date.date())
 executed_trades_df.to_csv(results_save_path + r"\executed_trades_" + test_id_string + ".csv", index=False)
 
 print(f"Number of options evaluated: {total_options_evaluated}")

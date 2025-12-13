@@ -1,26 +1,27 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
+from scipy.optimize import minimize
 from scipy.stats import norm
 from numba import njit
-
-# Work in progress; needs more commenting!
+from joblib import Parallel, delayed
 
 # Time step corresponding to 1 day, expressed in years
 dt = 1/365
 
-# Class used to simulate stock price evolution using Geometric Brownian Motion
+# Class used to simulate stock price evolution with the Geometric Brownian Motion Model
 class StockGBM:
     def __init__(self, n_paths, n_days, initial_price, drift, volatility):
         self.n_paths = n_paths              # We simulate stock price evolution on "n_paths" paths for stochastic pricing of options
         self.n_days = n_days                # Number of days to expiry for the option
         self.initial_price = initial_price  # Initial stock price
-        self.drift = drift                  # Drift of the stock
+        self.drift = drift                  # Drift of the stock; for option pricing, the drift is set to equal the risk-free interest rate
         self.volatility = volatility        # Volatility of the stock
 
     def simulate(self):
         # Independent random samples from the normal distribution used to build stock price path
-        eps = np.random.normal(size=(self.n_paths, self.n_days))
-        log_returns = (self.drift - 0.5 * self.volatility**2) * dt + self.volatility * eps * np.sqrt(dt)
+        Z = np.random.normal(size=(self.n_paths, self.n_days))
+        log_returns = (self.drift - 0.5 * self.volatility**2) * dt + self.volatility * Z * np.sqrt(dt)
 
         # This 2-d array contains "n_paths" simulated paths for the stock price evolution, each with "n_days" time steps, plus the initial step
         prices = np.zeros((self.n_paths, self.n_days + 1))
@@ -29,23 +30,23 @@ class StockGBM:
 
         return prices
 
-# Class used to simulate stock price evolution using the Heston Model (Stochastic Volatility)
+# Class used to simulate stock price evolution with the Heston Model (Stochastic Volatility)
 class StockHeston:
-    def __init__(self, n_paths, n_days, initial_price, drift, mean_variance, var_return_rate, vol_of_variance, correlation):
-        self.n_paths = n_paths
-        self.n_days = n_days
-        self.initial_price = initial_price
-        self.drift = drift
+    def __init__(self, n_paths, n_days, initial_price, drift, mean_variance, vol_of_variance, var_return_rate, correlation):
+        self.n_paths = n_paths                      # Number of simulation paths for the stock price evolution
+        self.n_days = n_days                        # Number of days to expiry for the option
+        self.initial_price = initial_price          # Initial stock price
+        self.drift = drift                          # Drift of the stock; for option pricing, the drift is set to equal the risk-free interest rate
         self.mean_variance = mean_variance          # Mean value to which the variance (square of volatility) returns during the simulation
-        self.var_return_rate = var_return_rate      # The rate at which the variance returns to the mean
         self.vol_of_variance = vol_of_variance      # The volatility of the variance
-        self.correlation = correlation              # The correlation between the random processes of the stock and the variance
+        self.var_return_rate = var_return_rate      # The rate at which the variance returns to the mean; requires calibration
+        self.correlation = correlation              # The correlation between the random processes of the stock and the variance; requires calibration
 
     def simulate(self):
         # Generate random samples from the normal distribution for the stock and variance and then correlate them
-        eps1 = np.random.normal(size=(self.n_paths, self.n_days))
-        eps2 = np.random.normal(size=(self.n_paths, self.n_days))
-        eps1_corr, eps2_corr = eps1, self.correlation * eps1 + np.sqrt(1 - self.correlation**2) * eps2
+        Z1 = np.random.normal(size=(self.n_paths, self.n_days))
+        Z2 = np.random.normal(size=(self.n_paths, self.n_days))
+        Z1_corr, Z2_corr = Z1, self.correlation * Z1 + np.sqrt(1 - self.correlation**2) * Z2
 
         # Create 2-d numpy array to store the values of the variance across the time steps, for each of the simulation paths
         variances = np.zeros((self.n_paths, self.n_days + 1))
@@ -54,7 +55,7 @@ class StockHeston:
         # Calculate variances independently
         for j in range(1, self.n_days + 1):
             variances[:, j] = (variances[:, j-1] + self.var_return_rate * (self.mean_variance - variances[:, j-1]) * dt +
-                               self.vol_of_variance * np.sqrt(variances[:, j-1]) * eps2_corr[:, j-1] * np.sqrt(dt))
+                               self.vol_of_variance * np.sqrt(variances[:, j-1]) * Z2_corr[:, j-1] * np.sqrt(dt))
             
             # Make sure the variance is never negative (since it is the square of the volatility, it has to be positive)
             variances[:, j] = np.maximum(variances[:, j], 0)
@@ -64,63 +65,97 @@ class StockHeston:
         prices[:, 0] = self.initial_price
 
         # Compute price evolution in exponential form
-        log_returns = (self.drift - 0.5 * variances[:, :-1]) * dt + np.sqrt(variances[:, :-1]) * eps1_corr * np.sqrt(dt)
+        log_returns = (self.drift - 0.5 * variances[:, :-1]) * dt + np.sqrt(variances[:, :-1]) * Z1_corr * np.sqrt(dt)
         prices[:, 1:] = self.initial_price * np.exp(np.cumsum(log_returns, axis=1))
 
         return prices
 
-@njit
-def quadratic_fit(x, y):
-    """
-    Quadratic regression function for the Least Squares Monte Carlo algorithm, based on the matrix formulation of the minimization problem.
+    # Function for calibrating the values of the var_return_rate and correlation of the Heston model to market data from the previous days before option pricing
+    @staticmethod
+    def calibrate(calibration_data, n_paths_calibration=500, n_simulations_calibration=10):
 
-    Parameters:
-        x (1-d numpy array): x-coordinates of points we are fitting.
-        y (1-d numpy array): y-coordinates of points we are fitting.
+        # Function that calculates how far from the market prices our predictions are, depending on var_return_rate and correlation
+        def cost_function(params):
+            var_return_rate, correlation = params
 
-    Returns:
-        1-d numpy array: Values of the fitted function evaluated at points x, according to LSMC.
-    """
-    # Number of points to fit
-    n = len(x)
+            # On each row of the calibration data we have different parameters for a given option (call/put), and for each row we have a call price and a put price;
+            # Calculate differences from market prices in parallel
+            def parallel_run(row):
+                cols = ["dte", "strike", "c_last", "p_last", "underlying_last", "rfr", "variance_30d", "vol_of_variance_30d"]
+                dte, strike, call_price, put_price, stock_price, rfr, mean_variance, vol_of_variance = row[cols].values
 
-    # Prepare sums of various products of x and y values
-    Sx, Sx2, Sx3, Sx4, Sy, Sxy, Sx2y = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                # The pricing model takes the strike prices as an array; the first strike corresponds to the call option, the second to the put option
+                strike_prices = np.array([strike, strike])
 
-    # Compute sums initialized above
-    for i in range(n):
-        xi = x[i]
-        yi = y[i]
-        x2 = xi * xi
-        Sx += xi
-        Sx2 += x2
-        Sx3 += x2 * xi
-        Sx4 += x2 * x2
-        Sy += yi
-        Sxy += xi * yi
-        Sx2y += x2 * yi
+                # This is an array with 2 elements; the first price is the call price, the second is the put price - both predicted with the stochastic model
+                predicted_prices = stochastic_option(n_paths=n_paths_calibration, n_days=dte,
+                                                    initial_price=stock_price, drift=rfr,
+                                                    mean_variance=mean_variance, vol_of_variance=vol_of_variance,
+                                                    var_return_rate=var_return_rate, correlation=correlation,
+                                                    strike_prices=strike_prices, rfr=rfr, n_calls=1, n_puts=1,
+                                                    stock_model="heston", n_simulations=n_simulations_calibration)
 
-    # The minimization problem can be expressed as a system of linear equations, A*u=v, where A is a 3x3 matrix containing the sums above,
-    # u is a 3x1 vector containing the unknown fit parameters, and v is another 3x1 vector built from the sums above
-    detA = Sx4*(Sx2*n - Sx*Sx) - Sx3*(Sx3*n - Sx2*Sx) + Sx2*(Sx3*Sx - Sx2*Sx2)
-    
-    # If the system of equations can't be solved, just return the original y values
-    if abs(detA) < 1e-6:
-        return y
+                # Difference between market prices and predicted prices
+                parallel_cost = (call_price - predicted_prices[0])**2 + (put_price - predicted_prices[1])**2
 
-    # Solve system of equations using Cramer's rule
-    a = (Sx2y*(Sx2*n - Sx*Sx) - Sxy*(Sx3*n - Sx2*Sx) + Sy*(Sx3*Sx - Sx2*Sx2)) / detA
-    b = (Sx4*(Sxy*n - Sx*Sy) - Sx3*(Sx2y*n - Sx2*Sy) + Sx2*(Sx2y*Sx - Sx2*Sxy)) / detA
-    c = (Sx4*(Sx2*Sy - Sxy*Sx) - Sx3*(Sx3*Sy - Sx2y*Sx) + Sx2*(Sx3*Sxy - Sx2y*Sx2)) / detA
+                return parallel_cost
 
-    # Return values of fitted quadratic function evaluated at coordinates x
-    return a * x**2 + b * x + c
+            # List of differences between market and predicted prices for each row in the calibration data; the total cost is the sum of the list's elements
+            cost_list = Parallel(n_jobs=-1)(delayed(parallel_run)(row) for _, row in calibration_data.iterrows())
+
+            return sum(cost_list)
+
+        # Initial guess and bounds for the var_return_rate and correlation
+        x0 = [2.0, 0.0]
+        bounds = [(0.1, 10.0), (-1.0, 1.0)]
+
+        result = minimize(cost_function, x0, method="Powell", bounds=bounds, options={"disp": False})
+
+        var_return_rate, correlation = result.x
+
+        return var_return_rate, correlation
+
+# Class used to simulate stock price evolution with the Merton Jump-Diffusion Model
+class StockJumpDiffusion:
+    def __init__(self, n_paths, n_days, initial_price, drift, volatility, n_jumps_avg, log_jump_size_avg, log_jump_size_std):
+        self.n_paths = n_paths                      # Number of simulation paths for the stock price evolution
+        self.n_days = n_days                        # Number of days to expiry for the option
+        self.initial_price = initial_price          # Initial stock price
+        self.drift = drift                          # Drift of the stock; for option pricing, the drift is set to equal the risk-free interest rate
+        self.volatility = volatility                # Volatility of the stock
+        self.n_jumps_avg = n_jumps_avg              # Average number of stock price jumps per year
+        self.log_jump_size_avg = log_jump_size_avg  # Average size of log jumps - the log jump sizes follow a normal distribution
+        self.log_jump_size_std = log_jump_size_std  # Standard deviation of the log jump sizes
+
+    def simulate(self):
+        # Random samples from the normal distribution for the diffusion process
+        Z = np.random.normal(size=(self.n_paths, self.n_days))
+
+        # Random samples from the Poisson distribution for the number of jumps per day
+        N = np.random.poisson(self.n_jumps_avg * dt, size=(self.n_paths, self.n_days))
+
+        # Exponentiated random samples from the normal distribution for the multiplicative jump factors
+        J = np.exp(np.random.normal(self.log_jump_size_avg, self.log_jump_size_std, size=(self.n_paths, self.n_days)))
+
+        # Average jump size as a percent of the initial price - considering that the jumps follow a log-normal distribution,
+        # and we know the parameters of the corresponding normal distribution of the log jumps
+        avg_jump = np.exp(self.log_jump_size_avg + 0.5 * self.log_jump_size_std**2) - 1
+
+        # The diffusion and jump processes are independent, so we can apply the GBM-type exponential formula for the diffusion term
+        # For option pricing, the total drift rate of the stock has to equal the risk-free rate, so we subtract the drift introduced by the jumps
+        diffusion_term = np.exp((self.drift - self.n_jumps_avg * avg_jump - 0.5 * self.volatility**2) * dt + self.volatility * Z * np.sqrt(dt))
+        jump_term = J**N
+
+        # Array to store prices for each simulation path
+        prices = np.zeros((self.n_paths, self.n_days + 1))
+        prices[:, 0] = self.initial_price
+        prices[:, 1:] = self.initial_price * np.cumprod(diffusion_term * jump_term, axis=1)
+
+        return prices
 
 # Class used for American-style option pricing with the Least Squares Monte Carlo method
 class OptionLSMC:
-    def __init__(self, n_paths, n_days, strike_prices, rfr, n_calls, n_puts):
-        self.n_paths = n_paths              # Number of simulation paths for the stock price evolution
-        self.n_days = n_days                # Number of days to expiry for the option
+    def __init__(self, strike_prices, rfr, n_calls, n_puts):
         self.strike_prices = strike_prices  # 1-d numpy array of strike prices to evaluate options at
         self.rfr = rfr                      # Risk free interest rate, used for present-day discounting
         self.n_calls = n_calls              # Number of call options to evaluate; first n_calls values in strike_prices are strikes for the call options
@@ -199,12 +234,51 @@ class OptionLSMC:
     def evaluate(self, stock_prices):
         return OptionLSMC.lsmc_batch(stock_prices, self.strike_prices, self.rfr, self.n_calls, self.n_puts, dt)
 
-def stochastic_option(n_paths=250, n_days=30,
-                      initial_price=100, drift=0.05,
-                      volatility=0.1,
-                      mean_variance=0.2**2, var_return_rate=0.4, vol_of_variance=0.2, correlation=0.0,
-                      strike_prices=np.array([100]), rfr=0.05, n_calls=1, n_puts=0,
-                      stock_model="gbm", option_model="lsmc", n_simulations=100):
+@njit
+def quadratic_fit(x, y):
+    """
+    Quadratic regression function for the Least Squares Monte Carlo algorithm, based on the matrix formulation of the minimization problem.
+
+    Parameters:
+        x (1-d numpy array): x-coordinates of points we are fitting.
+        y (1-d numpy array): y-coordinates of points we are fitting.
+
+    Returns:
+        1-d numpy array: Values of the fitted function evaluated at points x, according to LSMC.
+    """
+    # Number of points to fit
+    n = len(x)
+
+    # Prepare sums of various products of x and y values
+    Sx, Sx2, Sx3, Sx4, Sy, Sxy, Sx2y = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    # Compute sums initialized above
+    for i in range(n):
+        xi = x[i]; yi = y[i]; x2 = xi*xi
+        Sx += xi; Sx2 += x2; Sx3 += x2*xi; Sx4 += x2*x2
+        Sy += yi; Sxy += xi*yi; Sx2y += x2*yi
+
+    # The minimization problem can be expressed as a system of linear equations, A*u=v, where A is a 3x3 matrix containing the sums above,
+    # u is a 3x1 vector containing the unknown fit parameters, and v is another 3x1 vector built from the sums above
+    detA = Sx4*(Sx2*n - Sx*Sx) - Sx3*(Sx3*n - Sx2*Sx) + Sx2*(Sx3*Sx - Sx2*Sx2)
+    
+    # If the system of equations can't be solved, just return the original y values
+    if abs(detA) < 1e-6:
+        return y
+
+    # Solve system of equations using Cramer's rule
+    a = (Sx2y*(Sx2*n - Sx*Sx) - Sxy*(Sx3*n - Sx2*Sx) + Sy*(Sx3*Sx - Sx2*Sx2)) / detA
+    b = (Sx4*(Sxy*n - Sx*Sy) - Sx3*(Sx2y*n - Sx2*Sy) + Sx2*(Sx2y*Sx - Sx2*Sxy)) / detA
+    c = (Sx4*(Sx2*Sy - Sxy*Sx) - Sx3*(Sx3*Sy - Sx2y*Sx) + Sx2*(Sx3*Sxy - Sx2y*Sx2)) / detA
+
+    # Return values of fitted quadratic function evaluated at coordinates x
+    return a * x**2 + b * x + c
+
+def stochastic_option(n_paths, n_days, initial_price, drift, strike_prices, rfr, n_calls, n_puts,
+                      n_simulations, stock_model="gbm", option_model="lsmc",
+                      volatility=None,
+                      mean_variance=None, vol_of_variance=None, var_return_rate=None, correlation=None,
+                      n_jumps_avg=None, log_jump_size_avg=None, log_jump_size_std=None):
     """
     Function for batch evaluation of the prices of options at different strikes (same quote day and dte)
     with the LSMC algorithm, using a stochastic model for the stock price evolution.
@@ -214,7 +288,7 @@ def stochastic_option(n_paths=250, n_days=30,
                                          First n_calls elements are call strikes, the last n_puts are put strikes.
         n_calls (int): Number of call options to evaluate.
         n_puts (int): Number of put options to evaluate.
-        stock_model (string): The model used for stock price simulation. Currently supported are "gbm", "heston".
+        stock_model (string): The model used for stock price simulation. Currently supported are "gbm", "heston", "jd".
 
     Returns:
         1-d numpy array: Predicted values of each option for the corresponding strike prices in the batch strike_prices array.
@@ -222,12 +296,14 @@ def stochastic_option(n_paths=250, n_days=30,
     if stock_model == "gbm":
         s_model = StockGBM(n_paths, n_days, initial_price, drift, volatility)
     elif stock_model == "heston":
-        s_model = StockHeston(n_paths, n_days, initial_price, drift, mean_variance, var_return_rate, vol_of_variance, correlation)
+        s_model = StockHeston(n_paths, n_days, initial_price, drift, mean_variance, vol_of_variance, var_return_rate, correlation)
+    elif stock_model == "jd":
+        s_model = StockJumpDiffusion(n_paths, n_days, initial_price, drift, volatility, n_jumps_avg, log_jump_size_avg, log_jump_size_std)
     else:
         raise TypeError("Invalid stock model!")
 
     if option_model == "lsmc":
-        o_model = OptionLSMC(n_paths, n_days, strike_prices, rfr, n_calls, n_puts)
+        o_model = OptionLSMC(strike_prices, rfr, n_calls, n_puts)
     else:
         raise TypeError("Invalid option model!")
 
@@ -247,7 +323,7 @@ def stochastic_option(n_paths=250, n_days=30,
 
 # Function used for calculating the price of an European call or put option with the Black-Scholes model
 # The European option price is used as a rough approximation to the American option price for validation of the stochastic model
-def black_scholes_option(S=100, K=100, sigma=0.1, rfr=0.05, t=30/365, option_type="call"):
+def black_scholes_option(S, K, sigma, rfr, t, option_type):
     d1 = (np.log(S/K) + (rfr + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
     d2 = d1 - sigma * np.sqrt(t)
     if option_type == "call":
