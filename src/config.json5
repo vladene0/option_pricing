@@ -1,0 +1,58 @@
+{
+    // Underlying stock to backtest on; currently supported "SPY", "AAPL", "QQQ"
+    ticker: "SPY",
+
+    // Type of the backtest; "arb" for statistical arbitrage, "hedge" for delta-hedging
+    test_type: "arb",
+
+    // Model used for the stochastic simulation of the stock price; currently supported "gbm", "heston", "jd"
+    stock_model: "gbm",
+
+    // Start date for backtesting (YYYY-MM-DD)
+    start_date: "2021-07-22",
+
+    // End date for backtesting (YYYY-MM-DD)
+    end_date: "2021-07-28",
+
+    // Minimum number of days to expiration in order to consider trading an option
+    min_dte: 14,
+
+    // Number of strike prices below atm to evaluate for each dte, for each day
+    n_below_atm: 1,
+
+    // Number of strike prices above atm to evaluate for each dte, for each day
+    n_above_atm: 1,
+
+    // Number of stock evolution paths in the stochastic simulation
+    n_paths: 500,
+
+    // Number of simulations over which we average to find an option's most likely price
+    n_simulations: 500,
+
+    // Minimum relative difference between market price and simulated price in order to trade an option
+    min_rel_diff: 0.2,
+
+    // Maximum relative difference between market price and simulated price in order to trade an option
+    max_rel_diff: 0.3,
+
+    // Close profitable positions when the profit is greater than take_win*100 percent above initial market price
+    take_win: 0.1,
+
+    // Close losing positions when the loss is greater than stop_loss*100 percent of the initial market price
+    stop_loss: 0.1,
+
+    // Size of window for volatility calculation (in days)
+    window_vol: 30,
+
+    // Number of days before current pricing date from which we take data for Heston calibration
+    n_days_calibration: 1,
+
+    // Number of dte values per day for Heston calibration; total data points per day: (1call+1put)*n_dte_calibration
+    n_dte_calibration: 5,
+
+    // Number of years before current date from which we extract jump data for the Jump-Diffusion model
+    n_years_jump_data: 5,
+
+    // Minimum difference in stock price between consecutive days to count as a jump (percentage of initial price)
+    min_jump_size: 0.04
+}

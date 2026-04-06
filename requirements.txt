@@ -1,0 +1,9 @@
+numpy
+scipy
+pandas
+matplotlib
+json5
+numba
+joblib
+yfinance
+tqdm
